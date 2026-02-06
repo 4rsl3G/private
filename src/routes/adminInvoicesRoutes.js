@@ -50,41 +50,92 @@ module.exports = function adminInvoicesRoutes({ sequelize, Invoice, AppSetting, 
     res.json({ success: true });
   });
 
-  // Retry jika sudah PAID tapi premifyOrderId kosong / failed
-  r.post("/admin/invoices/:invoiceId/retry-fulfill", requireAdmin, adminLimiter, async (req, res) => {
-    const invoiceId = req.params.invoiceId;
+r.post("/admin/invoices/:invoiceId/retry-fulfill", requireAdmin, adminLimiter, async (req, res) => {
+  const invoiceId = req.params.invoiceId;
 
+  try {
     const result = await sequelize.transaction(async (t) => {
-      const inv = await Invoice.findOne({ where: { invoiceId }, transaction: t, lock: t.LOCK.UPDATE });
-      if (!inv) throw new Error("INVOICE_NOT_FOUND");
-      if (inv.status !== "PAID" && inv.status !== "FAILED") throw new Error("INVOICE_NOT_PAID_OR_FAILED");
-      if (inv.premifyOrderId && inv.status === "FULFILLED") return { status: "FULFILLED", premifyOrderId: inv.premifyOrderId };
+      const inv = await Invoice.findOne({
+        where: { invoiceId },
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
 
+      if (!inv) return { ok: false, code: "INVOICE_NOT_FOUND" };
+
+      // ✅ kalau sudah pernah punya premifyOrderId, JANGAN bikin order lagi
+      // Ini bikin endpoint jadi idempotent.
+      if (inv.premifyOrderId) {
+        // optional: coba refetch receipt sekalian
+        let receipt = null;
+        try {
+          const list = await premifyGetTransactions(AppSetting);
+          receipt = list.find((x) => x.order_id === inv.premifyOrderId) || null;
+        } catch {}
+
+        if (receipt) {
+          await inv.update(
+            { premifyReceiptJson: JSON.stringify(receipt) },
+            { transaction: t }
+          );
+        }
+
+        return {
+          ok: true,
+          status: inv.status,
+          premifyOrderId: inv.premifyOrderId,
+          reused: true,
+          receipt: receipt || null,
+        };
+      }
+
+      // ✅ hanya boleh retry kalau status PAID atau FAILED
+      if (inv.status !== "PAID" && inv.status !== "FAILED") {
+        return { ok: false, code: "INVOICE_NOT_PAID_OR_FAILED", status: inv.status };
+      }
+
+      // ✅ bikin order sekali saja
       const prem = await premifyCreateOrder(AppSetting, {
         variantId: inv.variantId,
         quantity: inv.quantity || 1,
         voucherCode: inv.voucherCode || undefined,
-        emailInvite: inv.emailInvite || undefined
+        emailInvite: inv.emailInvite || undefined,
       });
 
+      // receipt optional
       let receipt = null;
       try {
         const list = await premifyGetTransactions(AppSetting);
-        receipt = list.find(x => x.order_id === prem.order_id) || null;
+        receipt = list.find((x) => x.order_id === prem.order_id) || null;
       } catch {}
 
-      await inv.update({
-        status: "FULFILLED",
-        premifyOrderId: prem.order_id,
-        premifyReceiptJson: receipt ? JSON.stringify(receipt) : null
-      }, { transaction: t });
+      await inv.update(
+        {
+          status: "FULFILLED",
+          premifyOrderId: prem.order_id,
+          premifyReceiptJson: receipt ? JSON.stringify(receipt) : null,
+        },
+        { transaction: t }
+      );
 
-      return { status: "FULFILLED", premifyOrderId: prem.order_id, receipt };
+      return { ok: true, status: "FULFILLED", premifyOrderId: prem.order_id, reused: false, receipt };
     });
 
-    eventBus.emit("invoice:update", { invoiceId, status: "FULFILLED", source: "admin-retry" });
-    res.json({ success: true, data: result });
-  });
+    if (!result.ok) return res.status(400).json({ error: result.code, status: result.status });
+
+    eventBus.emit("invoice:update", {
+      invoiceId,
+      status: result.status,
+      premifyOrderId: result.premifyOrderId,
+      source: result.reused ? "admin-retry-reuse" : "admin-retry-new",
+    });
+
+    return res.json({ success: true, data: result });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "INTERNAL_ERROR" });
+  }
+});
 
   // Refetch receipt dari /transactions (kalau telat muncul)
   r.post("/admin/invoices/:invoiceId/refetch-receipt", requireAdmin, adminLimiter, async (req, res) => {
