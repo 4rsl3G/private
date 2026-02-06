@@ -44,7 +44,7 @@ async function main() {
 
   const app = express();
 
-  app.set("trust proxy", true);
+  app.set("trust proxy", 1);
 
   app.use(helmet({
     contentSecurityPolicy: false // backend API; kalau serve HTML nanti bisa disetel
