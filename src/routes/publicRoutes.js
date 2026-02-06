@@ -1,3 +1,4 @@
+// src/routes/publicRoutes.js
 const express = require("express");
 const { Op } = require("sequelize");
 const QRCode = require("qrcode");
@@ -24,13 +25,12 @@ const {
    ========================= */
 
 function getClientIp(req) {
-  // since app.set("trust proxy", 1) in server.js, req.ip is good
-  // fallback in case of local usage
+  // server.js: app.set("trust proxy", 1)
   return req.ip || req.socket?.remoteAddress || null;
 }
 
 function nowYmdJakartaApprox() {
-  // cukup untuk harian (Gobiz mutasi biasanya harian)
+  // Gobiz mutasi biasanya harian
   return new Date().toISOString().slice(0, 10);
 }
 
@@ -73,12 +73,12 @@ function normalizeToItems(obj) {
     return s ? [{ label: "Akses", value: s }] : [];
   }
 
-  // array
+  // array of {label,value}
   if (Array.isArray(obj)) {
     const out = [];
     for (const x of obj) {
       if (!x) continue;
-      const k = x.label || x.key || x.name;
+      const k = x.label || x.key || x.name || x.title;
       const v = x.value || x.val || x.data;
       if (k && v) out.push({ label: String(k), value: String(v) });
     }
@@ -106,7 +106,7 @@ function scanLikelyCredentialKeys(raw) {
     "password", "pass", "pin",
     "otp", "code",
     "link", "url",
-    "notes", "note"
+    "notes", "note",
   ];
 
   const out = [];
@@ -114,7 +114,7 @@ function scanLikelyCredentialKeys(raw) {
 
   for (const [k, v] of Object.entries(flat)) {
     const lk = String(k).toLowerCase();
-    if (!keys.some(x => lk.includes(x))) continue;
+    if (!keys.some((x) => lk.includes(x))) continue;
     const val = String(v || "").trim();
     if (!val) continue;
     out.push({ label: prettifyKey(k), value: val });
@@ -123,9 +123,48 @@ function scanLikelyCredentialKeys(raw) {
   return out.slice(0, 12);
 }
 
+/**
+ * ✅ Premify receipt structure:
+ * account_details: [
+ *   { details: [ { credentials: [{label,value}, ...] } ] }
+ * ]
+ */
+function extractItemsFromPremifyAccountDetails(raw) {
+  const out = [];
+  const ads = raw?.account_details;
+
+  if (!Array.isArray(ads)) return out;
+
+  for (const ad of ads) {
+    const details = Array.isArray(ad?.details) ? ad.details : [];
+    for (const d of details) {
+      const creds = Array.isArray(d?.credentials) ? d.credentials : [];
+      for (const c of creds) {
+        const label = String(c?.label || "").trim();
+        const value = String(c?.value || "").trim();
+        if (label && value) out.push({ label, value });
+      }
+    }
+  }
+
+  // dedupe
+  const seen = new Set();
+  return out.filter((x) => {
+    const k = `${x.label}::${x.value}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function extractAccess(raw) {
   if (!raw) return { items: [], note: "Receipt belum tersedia." };
 
+  // ✅ 1) Premify structure first
+  const premifyItems = extractItemsFromPremifyAccountDetails(raw);
+  if (premifyItems.length) return { items: premifyItems, note: raw.note || null };
+
+  // ✅ 2) other candidates
   const candidates = [
     raw.account_details,
     raw.accountDetail,
@@ -140,6 +179,7 @@ function extractAccess(raw) {
     if (items.length) return { items, note: raw.note || null };
   }
 
+  // ✅ 3) last resort scan
   const items = scanLikelyCredentialKeys(raw);
   if (items.length) return { items, note: raw.note || null };
 
@@ -212,7 +252,7 @@ module.exports = function publicRoutes({
   });
 
   /* =========================
-     POST /v1/checkout  (idempotent)
+     POST /v1/checkout (idempotent)
      header: X-Idempotency-Key (optional)
      ========================= */
   r.post("/v1/checkout", checkoutLimiter, async (req, res) => {
@@ -235,9 +275,10 @@ module.exports = function publicRoutes({
             status: existing.status,
             expiresAt: existing.expiresAt,
             payAmount: existing.payAmount,
-            qrisUrl: existing.status === "PENDING"
-              ? `${baseWeb}/qris/payment/${existing.publicToken}`
-              : null,
+            qrisUrl:
+              existing.status === "PENDING"
+                ? `${baseWeb}/qris/payment/${existing.publicToken}`
+                : null,
           },
         });
       }
@@ -275,6 +316,7 @@ module.exports = function publicRoutes({
 
     if (!found) return res.status(404).json({ error: "VARIANT_NOT_FOUND" });
 
+    // Invite type requires emailInvite
     if (isInviteType(varType) && !emailInvite) {
       return res.status(400).json({ error: "emailInvite required for Invite type" });
     }
@@ -355,7 +397,7 @@ module.exports = function publicRoutes({
 
   /* =========================
      GET /v1/invoice/:invoiceId/receipt
-     - sekarang return normalized access + raw
+     - return normalized access + raw
      ========================= */
   r.get("/v1/invoice/:invoiceId/receipt", publicLimiter, async (req, res) => {
     const inv = await Invoice.findOne({ where: { invoiceId: req.params.invoiceId } });
@@ -391,6 +433,7 @@ module.exports = function publicRoutes({
 
     if (inv.status !== "PENDING") return res.status(404).send("Not Found");
 
+    // expire on demand
     if (new Date(inv.expiresAt).getTime() < Date.now()) {
       await inv.update({ status: "EXPIRED" });
       eventBus.emit("invoice:update", { invoiceId: inv.invoiceId, status: "EXPIRED" });
@@ -426,6 +469,7 @@ module.exports = function publicRoutes({
       const inv = await Invoice.findOne({ where: { invoiceId } });
       if (!inv) return res.status(404).json({ error: "INVOICE_NOT_FOUND" });
 
+      // short-circuit
       if (inv.status === "FULFILLED") {
         return res.json({
           success: true,
@@ -516,7 +560,7 @@ module.exports = function publicRoutes({
               emailInvite: locked.emailInvite || undefined,
             });
 
-            // Try store receipt (NON-BLOCKING)
+            // store receipt (NON-BLOCKING)
             let receipt = null;
             try {
               const list = await premifyGetTransactions(AppSetting);
@@ -547,9 +591,7 @@ module.exports = function publicRoutes({
 
           return res.json({ success: true, invoiceId, ...result });
         } catch (e) {
-          // NOTE: kalau sudah create prem order tapi error lain,
-          // jangan langsung FAILED kalau status di DB sudah PAID/FULFILLED.
-          // Kita set FAILED hanya bila masih PENDING/PAID tanpa orderId.
+          // recover if already has orderId / fulfilled
           const cur = await Invoice.findOne({ where: { invoiceId } });
 
           if (cur && (cur.status === "FULFILLED" || cur.premifyOrderId)) {
