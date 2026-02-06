@@ -46,9 +46,17 @@ async function main() {
 
   app.set("trust proxy", 1);
 
-  app.use(helmet({
-    contentSecurityPolicy: false // backend API; kalau serve HTML nanti bisa disetel
-  }));
+  app.use(
+  helmet({
+    contentSecurityPolicy: false,
+
+    // ✅ penting: biar IMG/QR dari domain api bisa dipakai oleh web domain lain
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+
+    // ✅ biar tidak ganggu embed/resource lintas origin
+    crossOriginEmbedderPolicy: false,
+  })
+);
 
   app.use(cors({ origin: true, credentials: true }));
 
