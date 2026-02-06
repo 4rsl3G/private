@@ -1,0 +1,191 @@
+# /etc/nginx/sites-available/pansa.conf
+# FRONTEND: 127.0.0.1:3000  (pansa.my.id)
+# BACKEND : 127.0.0.1:5000  (api.pansa.my.id)
+#
+# Cloudflare Real IP + Rate Limit (berdasarkan IP asli user)
+
+# =========================
+# 0) REAL IP dari Cloudflare
+# =========================
+real_ip_header CF-Connecting-IP;
+real_ip_recursive on;
+
+# Cloudflare IPv4 ranges (official)
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from 103.21.244.0/22;
+set_real_ip_from 103.22.200.0/22;
+set_real_ip_from 103.31.4.0/22;
+set_real_ip_from 141.101.64.0/18;
+set_real_ip_from 108.162.192.0/18;
+set_real_ip_from 190.93.240.0/20;
+set_real_ip_from 188.114.96.0/20;
+set_real_ip_from 197.234.240.0/22;
+set_real_ip_from 198.41.128.0/17;
+set_real_ip_from 162.158.0.0/15;
+set_real_ip_from 104.16.0.0/13;
+set_real_ip_from 104.24.0.0/14;
+set_real_ip_from 172.64.0.0/13;
+set_real_ip_from 131.0.72.0/22;
+
+# Cloudflare IPv6 ranges (official)
+set_real_ip_from 2400:cb00::/32;
+set_real_ip_from 2606:4700::/32;
+set_real_ip_from 2803:f800::/32;
+set_real_ip_from 2405:b500::/32;
+set_real_ip_from 2405:8100::/32;
+set_real_ip_from 2a06:98c0::/29;
+set_real_ip_from 2c0f:f248::/32;
+
+# =========================
+# 1) RATE LIMIT ZONES
+# =========================
+# NOTE: karena sudah pakai real IP, $binary_remote_addr = IP asli user (bukan IP Cloudflare)
+limit_req_zone $binary_remote_addr zone=rl_front:10m rate=20r/s;  # umum frontend
+limit_req_zone $binary_remote_addr zone=rl_api:10m   rate=15r/s;  # API umum
+limit_req_zone $binary_remote_addr zone=rl_auth:10m  rate=5r/s;   # endpoint sensitif (checkout/login)
+limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+
+# =========================
+# 2) UPSTREAM
+# =========================
+upstream pansa_frontend {
+  server 127.0.0.1:3000;
+  keepalive 32;
+}
+upstream pansa_backend {
+  server 127.0.0.1:5000;
+  keepalive 32;
+}
+
+# =========================
+# 3) REDIRECT HTTP -> HTTPS
+# =========================
+server {
+  listen 80;
+  listen [::]:80;
+  server_name pansa.my.id api.pansa.my.id;
+
+  # Allow Let's Encrypt / Certbot challenge
+  location /.well-known/acme-challenge/ {
+    root /var/www/html;
+  }
+
+  return 301 https://$host$request_uri;
+}
+
+# =========================
+# 4) FRONTEND: pansa.my.id (Next.js)
+# =========================
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name pansa.my.id;
+
+  # SSL (sesuaikan path cert kamu)
+  ssl_certificate     /etc/letsencrypt/live/pansa.my.id/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/pansa.my.id/privkey.pem;
+
+  # Security headers (aman buat web)
+  add_header X-Content-Type-Options nosniff always;
+  add_header X-Frame-Options SAMEORIGIN always;
+  add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+  # Connection limit
+  limit_conn conn_per_ip 40;
+
+  # Global rate limit (frontend)
+  limit_req zone=rl_front burst=80 nodelay;
+
+  # Proxy settings umum
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  # Websocket (kalau suatu saat dipakai)
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection $connection_upgrade;
+
+  # Next.js static caching
+  location /_next/static/ {
+    proxy_pass http://pansa_frontend;
+    access_log off;
+    expires 30d;
+    add_header Cache-Control "public, max-age=2592000, immutable";
+  }
+
+  # Public assets caching
+  location ~* \.(?:css|js|mjs|png|jpg|jpeg|gif|svg|webp|ico|woff2?)$ {
+    proxy_pass http://pansa_frontend;
+    access_log off;
+    expires 7d;
+    add_header Cache-Control "public, max-age=604800";
+  }
+
+  location / {
+    proxy_pass http://pansa_frontend;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+  }
+}
+
+# =========================
+# 5) BACKEND: api.pansa.my.id (Node/Express :5000)
+# =========================
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name api.pansa.my.id;
+
+  ssl_certificate     /etc/letsencrypt/live/api.pansa.my.id/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/api.pansa.my.id/privkey.pem;
+
+  add_header X-Content-Type-Options nosniff always;
+  add_header Referrer-Policy no-referrer always;
+
+  # Connection limit
+  limit_conn conn_per_ip 30;
+
+  # Proxy settings umum
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  # Websocket/SSE support
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection $connection_upgrade;
+  proxy_buffering off;
+
+  # Default rate limit API
+  limit_req zone=rl_api burst=60 nodelay;
+
+  # Endpoint sensitif: contoh checkout / auth / admin (sesuaikan path kamu)
+  location ~* ^/(checkout|pay|invoice|auth|login|register|admin)/ {
+    limit_req zone=rl_auth burst=20 nodelay;
+    proxy_pass http://pansa_backend;
+    proxy_read_timeout 90s;
+    proxy_send_timeout 90s;
+  }
+
+  # Health check (tanpa limit kalau mau)
+  location = /health {
+    limit_req off;
+    proxy_pass http://pansa_backend;
+  }
+
+  # Semua API lain
+  location / {
+    proxy_pass http://pansa_backend;
+    proxy_read_timeout 90s;
+    proxy_send_timeout 90s;
+  }
+}
+
+# Required for websocket header mapping (global)
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  '' close;
+}
